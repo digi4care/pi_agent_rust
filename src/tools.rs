@@ -5072,6 +5072,17 @@ fn escaped_file_tag_name(path: &Path) -> String {
     escape_file_tag_attribute(&path.display().to_string())
 }
 
+/// The window git sniffs for binary content.
+const BINARY_SNIFF_BYTES: usize = 8192;
+
+/// A NUL byte, or bytes that are not UTF-8, in the first 8 KiB. A multibyte
+/// character cut off at the window edge is still text.
+fn looks_binary(bytes: &[u8]) -> bool {
+    let header = bytes.get(..BINARY_SNIFF_BYTES).unwrap_or(bytes);
+    header.contains(&0)
+        || std::str::from_utf8(header).is_err_and(|error| error.error_len().is_some())
+}
+
 fn append_file_notice_block(out: &mut String, path: &Path, notice: &str) {
     let path_str = escaped_file_tag_name(path);
     let _ = writeln!(out, "<file name=\"{path_str}\">\n{notice}\n</file>");
@@ -5296,6 +5307,14 @@ pub fn process_file_arguments(
 
         if let Some(mime_type) = media_mime_type {
             append_media_argument(&mut out, &absolute_path, &bytes, mime_type);
+        } else if looks_binary(&bytes) {
+            // Decoded as text it would be up to a megabyte of replacement
+            // characters. OMP skips binary mentions the same way.
+            append_file_notice_block(
+                &mut out.text,
+                &absolute_path,
+                &format!("[Binary file ({} bytes), not included.]", bytes.len()), // ubs:ignore[rust.perf.string-alloc-in-loop] -- once per binary @file argument
+            );
         } else {
             append_text_file_block(&mut out.text, &absolute_path, &bytes);
         }
@@ -5846,7 +5865,10 @@ impl ToolRegistry {
                 // installed by the interactive host) and joins via
                 // extend_tools in main.rs/sdk.rs, like "todo".
                 "ast_grep" => tools.push(Box::new(crate::ast_tools::AstGrepTool::new(cwd))),
-                "ast_edit" => tools.push(Box::new(crate::ast_tools::AstEditTool::new(cwd))),
+                "ast_edit" => tools.push(Box::new(
+                    crate::ast_tools::AstEditTool::new(cwd)
+                        .with_mutation_recorder(mutation_recorder.clone()),
+                )),
                 "lsp" => tools.push(Box::new(crate::lsp::LspTool::new(cwd, config))),
                 "debug" => tools.push(Box::new(crate::debug::DebugTool::new(cwd, config))),
                 "inspect_image" => {
@@ -7563,6 +7585,19 @@ impl Tool for ReadTool {
         truncation.total_lines = total_lines;
 
         let mut output_text = std::mem::take(&mut truncation.content);
+        // A line the byte limit cut off would read as complete and the
+        // continue offset would skip its tail; with hashline its tag (of the
+        // whole line) still validates, so an edit of it dropped the unseen
+        // tail. Show whole lines only; the next read starts at the cut line.
+        if truncation.last_line_partial
+            && !truncation.first_line_exceeds_limit
+            && let Some(last_newline) = output_text.rfind('\n')
+        {
+            output_text.truncate(last_newline);
+            truncation.output_lines = truncation.output_lines.saturating_sub(1);
+            truncation.output_bytes = output_text.len();
+            truncation.last_line_partial = false;
+        }
         let mut details: Option<serde_json::Value> = None;
 
         if truncation.first_line_exceeds_limit {
@@ -8077,6 +8112,7 @@ async fn run_bash_command_with_state(
     for (key, value) in crate::http::proxy::child_process_env() {
         cmd.env(key, value);
     }
+    cmd.envs(crate::bash_mediation::NON_INTERACTIVE_ENV.iter().copied());
 
     // Place the shell in its own process group so background children
     // can be killed reliably even if the shell exits first.
@@ -8448,6 +8484,9 @@ pub(crate) async fn run_bash_command_pty(
     pty_cmd.cwd(cwd);
     // #210: same proxy propagation as the pipe path.
     for (key, value) in crate::http::proxy::child_process_env() {
+        pty_cmd.env(key, value);
+    }
+    for (key, value) in crate::bash_mediation::NON_INTERACTIVE_ENV {
         pty_cmd.env(key, value);
     }
 
@@ -10735,23 +10774,17 @@ fn strip_bom(s: &str) -> (&str, bool) {
         .map_or_else(|| (s, false), |stripped| (stripped, true))
 }
 
+/// The first LF decides, as in OMP: CRLF when a CR precedes it. A lone CR
+/// before it is content (a carriage return inside a string literal, or the
+/// first CR of `\r\r\n`); only a file with no LF at all is CR-terminated.
 fn detect_line_ending(content: &str) -> &'static str {
-    let bytes = content.as_bytes();
-    let mut idx = 0;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'\r' => {
-                return if bytes.get(idx + 1) == Some(&b'\n') {
-                    "\r\n"
-                } else {
-                    "\r"
-                };
-            }
-            b'\n' => return "\n",
-            _ => idx += 1,
+    match content.find('\n') {
+        Some(lf) if lf.checked_sub(1).and_then(|cr| content.as_bytes().get(cr)) == Some(&b'\r') => {
+            "\r\n"
         }
+        None if content.contains('\r') => "\r",
+        Some(_) | None => "\n",
     }
-    "\n"
 }
 
 fn normalize_to_lf(text: &str) -> String {
@@ -11368,9 +11401,30 @@ fn apply_unique_text_replacement(
     // occurrence counting (avoids 2x redundant O(n) normalization).
     let precomputed_content = build_normalized_content(content_for_matching.as_ref());
 
-    let mut best_match: Option<(FuzzyMatchResult, String, String)> = None;
+    // A CRLF file matches the LF needle exactly once their line endings
+    // agree. Left to the fuzzy pass, which trims each line's trailing
+    // whitespace (the CR with it), a needle ending in whitespace leaves that
+    // whitespace outside the matched span and the replacement doubles it.
+    let mut best_match: Option<(FuzzyMatchResult, String, String)> = if original_ending == "\r\n" {
+        variants.iter().find_map(|variant| {
+            let crlf = variant.replace('\n', "\r\n");
+            let index = content_for_matching.find(crlf.as_str())?;
+            let found = FuzzyMatchResult {
+                found: true,
+                index,
+                match_length: crlf.len(),
+                exact_match: true,
+            };
+            Some((found, build_normalized_content(&crlf), crlf))
+        })
+    } else {
+        None
+    };
 
     for variant in variants {
+        if best_match.is_some() {
+            break;
+        }
         let precomputed_variant = build_normalized_content(&variant);
         let match_result = fuzzy_find_text_with_normalized(
             content_for_matching.as_ref(),
@@ -11385,7 +11439,7 @@ fn apply_unique_text_replacement(
         }
     }
 
-    let Some((match_result, _precomputed_variant, matched_variant)) = best_match else {
+    let Some((match_result, precomputed_variant, matched_variant)) = best_match else {
         return Err(Error::tool(
             tool,
             format!(
@@ -11395,11 +11449,14 @@ fn apply_unique_text_replacement(
     };
 
     // Count occurrences in the same matching mode to avoid false ambiguity
-    // when normalized matching collapses distinct trailing whitespace.
+    // when normalized matching collapses distinct trailing whitespace. The
+    // approximate count uses the normalized needle that matched; the raw text
+    // can contain whitespace or quotes the normalized file no longer has, and
+    // would count zero copies of an ambiguous match.
     let occurrences = if match_result.exact_match {
         count_overlapping_occurrences(content_for_matching.as_ref(), &matched_variant)
     } else {
-        count_overlapping_occurrences(&precomputed_content, &normalized_old_text)
+        count_overlapping_occurrences(&precomputed_content, &precomputed_variant)
     };
 
     if occurrences > 1 {
@@ -11413,8 +11470,14 @@ fn apply_unique_text_replacement(
 
     // Perform replacement in the original coordinate space to preserve
     // line endings and unmatched content exactly.
-    let idx = match_result.index;
-    let match_len = match_result.match_length;
+    let mut idx = match_result.index;
+    let mut match_len = match_result.match_length;
+    // An oldText that starts with "\n" matches the LF half of a CRLF pair.
+    // Take the CR too, or the replacement's own line ending leaves it stray.
+    if content_no_bom[idx..].starts_with('\n') && content_no_bom[..idx].ends_with('\r') {
+        idx -= 1;
+        match_len += 1;
+    }
 
     // Adapt new_text to match the file's line endings.
     let adapted_new_text = restore_line_endings(&normalize_to_lf(new_text), original_ending);
@@ -11585,7 +11648,13 @@ fn apply_hashline_edits_to_content(
                     }
                 };
                 resolved.push(ResolvedEdit {
-                    op: "append",
+                    // Like prepend: an empty file's only "line" is replaced,
+                    // not kept as a leading blank line.
+                    op: if file_lines == [""] && edit.pos.is_none() {
+                        "replace"
+                    } else {
+                        "append"
+                    },
                     start: idx,
                     end: idx,
                     lines: replacement_lines,
@@ -11939,10 +12008,12 @@ impl Tool for EditTool {
         // Read the transformation source through the validated, no-follow
         // descriptor path. The digest of these exact bytes becomes the
         // optimistic-CAS expectation checked immediately before rename.
+        // Same roots as the scope check and the atomic replace, so files
+        // under an /add-dir root are editable.
         let path_for_read = absolute_path.clone();
-        let cwd_for_read = self.cwd.clone();
+        let roots_for_read = self.workspace.snapshot_or(&self.cwd).all();
         let raw = asupersync::runtime::spawn_blocking_io(move || {
-            read_scoped_file_capped_sync(&path_for_read, &cwd_for_read, READ_TOOL_MAX_BYTES)
+            read_file_capped_within_roots_sync(&path_for_read, &roots_for_read, READ_TOOL_MAX_BYTES)
         })
         .await
         .map_err(|e| Error::tool("edit", format!("Failed to read file: {e}")))?;
@@ -12153,6 +12224,22 @@ impl WriteTool {
     }
 }
 
+/// Whether the last non-empty line is one of read's continue notices
+/// (`[Showing lines …]` or `[N more lines in file. …]`).
+fn ends_with_read_truncation_notice(content: &str) -> bool {
+    content
+        .trim_end()
+        .rsplit(['\n', '\r'])
+        .next()
+        .map(str::trim)
+        .is_some_and(|line| {
+            line.ends_with(" to continue.]")
+                && line.contains("Use offset=")
+                && (line.starts_with("[Showing lines ")
+                    || (line.starts_with('[') && line.contains(" more lines in file.")))
+        })
+}
+
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for WriteTool {
@@ -12334,6 +12421,20 @@ impl Tool for WriteTool {
                         _ => format!("Failed to open file for writing: {err}"),
                     };
                     return Err(Error::tool("write", message));
+                }
+                // Content that ends in read's continue notice is a truncated
+                // read written back: it would cut the file to what that read
+                // showed. OMP refuses it the same way.
+                if ends_with_read_truncation_notice(&input.content)
+                    && meta.len() > u64::try_from(input.content.len()).unwrap_or(u64::MAX)
+                {
+                    return Err(Error::tool(
+                        "write",
+                        format!(
+                            "Refusing to overwrite {} with an incomplete read: the content ends with read's truncation notice and is shorter than the file, so the unread rest would be lost. Read the remaining lines and write the whole file, or use edit for a partial change.",
+                            input.path
+                        ),
+                    ));
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -17432,10 +17533,12 @@ impl Tool for HashlineEditTool {
         // Read the transformation source through the validated, no-follow
         // descriptor path. The digest of these exact bytes becomes the
         // optimistic-CAS expectation checked immediately before rename.
+        // Same roots as the scope check and the atomic replace, so files
+        // under an /add-dir root are editable.
         let path_for_read = absolute_path.clone();
-        let cwd_for_read = self.cwd.clone();
+        let roots_for_read = self.workspace.snapshot_or(&self.cwd).all();
         let raw = asupersync::runtime::spawn_blocking_io(move || {
-            read_scoped_file_capped_sync(&path_for_read, &cwd_for_read, READ_TOOL_MAX_BYTES)
+            read_file_capped_within_roots_sync(&path_for_read, &roots_for_read, READ_TOOL_MAX_BYTES)
         })
         .await
         .map_err(|e| Error::tool("hashline_edit", format!("Cannot read file: {e}")))?;
@@ -20929,6 +21032,48 @@ mod tests {
     }
 
     #[test]
+    fn edit_tools_modify_files_inside_additional_root() {
+        // The read between the scope check and the atomic replace used to
+        // allow only the primary cwd, so every edit in an /add-dir root failed.
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let file = extra.path().join("extra.txt");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+
+        let mut handle = crate::workspace::WorkspaceHandle::single(primary.path());
+        let canonical = crate::workspace::validate_new_root(extra.path()).unwrap();
+        handle.add_root(&canonical);
+        let file_path = file.to_string_lossy().to_string();
+
+        asupersync::test_utils::run_test(|| {
+            let edit = EditTool::new(primary.path()).with_workspace(handle.clone());
+            let hashline = HashlineEditTool::new(primary.path()).with_workspace(handle.clone());
+            let file_path = file_path.clone();
+            async move {
+                edit.execute(
+                    "t",
+                    serde_json::json!({ "path": file_path, "oldText": "one", "newText": "uno" }),
+                    None,
+                )
+                .await
+                .unwrap();
+                hashline
+                    .execute(
+                        "t",
+                        serde_json::json!({
+                            "path": file_path,
+                            "edits": [{"op": "replace", "pos": format_hashline_tag(1, "two"), "lines": ["dos"]}],
+                        }),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "uno\ndos\n");
+    }
+
+    #[test]
     fn read_tool_spans_additional_roots_and_revokes_on_removal() {
         // Multi-root acceptance (bd-cv653.3.12): read succeeds in the
         // additional root, paths outside every root fail closed, and
@@ -21354,6 +21499,52 @@ mod tests {
     }
 
     #[test]
+    fn read_byte_limit_shows_whole_lines_and_continues_at_the_cut_line() {
+        // The byte limit used to cut the last shown line mid-way, with no
+        // marker, and point the continue offset past it.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let body = "x".repeat(2995);
+            let content = (0..1000)
+                .map(|i| format!("{i:04}{body}\n"))
+                .collect::<Vec<_>>()
+                .concat();
+            let path = tmp.path().join("wide.txt");
+            std::fs::write(&path, &content).expect("write");
+            let tool = ReadTool::new(tmp.path());
+            for hashline in [false, true] {
+                let out = tool
+                    .execute(
+                        "t",
+                        serde_json::json!({ "path": path.to_string_lossy(), "hashline": hashline }),
+                        None,
+                    )
+                    .await
+                    .expect("read");
+                let text = get_text(&out.content);
+                let notice_at = text.find("\n\n[Showing lines").expect("byte-limit notice");
+                let (shown, notice) = text.split_at(notice_at);
+                let next: usize = notice
+                    .split("offset=")
+                    .nth(1)
+                    .map(|rest| {
+                        rest.chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect::<String>()
+                    })
+                    .and_then(|digits| digits.parse().ok())
+                    .expect("continue offset");
+                // The last shown line is whole and is the one before `next`.
+                let last = shown.lines().last().expect("a shown line");
+                let whole = format!("{:04}{body}", next - 2);
+                assert!(last.ends_with(&whole), "hashline={hashline}: {last:.40}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+                let cut = format!("{:04}x", next - 1);
+                assert!(!shown.contains(&cut), "hashline={hashline}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            }
+        });
+    }
+
+    #[test]
     fn test_read_first_line_exceeds_max_bytes() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
@@ -21541,6 +21732,63 @@ mod tests {
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("exist.txt")).unwrap();
             assert_eq!(contents, "new content");
+        });
+    }
+
+    /// A truncated read written back would cut the file to what was shown.
+    #[test]
+    fn write_refuses_a_truncated_read_that_is_shorter_than_the_file() {
+        async fn write_with(tool: &WriteTool, input: serde_json::Value) -> Result<ToolOutput> {
+            tool.execute("t", input, None).await
+        }
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("big.txt");
+            let lines = |n: usize| {
+                (0..n)
+                    .map(|i| format!("line {i}\n"))
+                    .collect::<Vec<_>>()
+                    .concat()
+            };
+            let original = lines(5000);
+            std::fs::write(&path, &original).expect("write");
+            let tool = WriteTool::new(tmp.path());
+            let write = |content: String| {
+                let input =
+                    serde_json::json!({ "path": path.to_string_lossy(), "content": content });
+                write_with(&tool, input)
+            };
+            let shown = lines(2000);
+            for notice in [
+                "[Showing lines 1-2000 of 5000. Use offset=2001 to continue.]",
+                "[3000 more lines in file. Use offset=2001 to continue.]",
+            ] {
+                let err = write(format!("{shown}\n{notice}\n"))
+                    .await
+                    .expect_err("truncated read refused");
+                assert!(err.to_string().contains("incomplete read"), "{err}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+                assert_eq!(std::fs::read_to_string(&path).expect("read"), original);
+            }
+            // A notice-like last line in content as long as the file is the
+            // model's own choice, and a new file has nothing to lose.
+            let longer =
+                format!("{original}[Showing lines 1-2000 of 5000. Use offset=2001 to continue.]\n");
+            write(longer.clone())
+                .await
+                .expect("not shorter than the file");
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), longer);
+            let fresh = tmp.path().join("fresh.txt");
+            WriteTool::new(tmp.path())
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": fresh.to_string_lossy(),
+                        "content": "x\n[2 more lines in file. Use offset=2 to continue.]",
+                    }),
+                    None,
+                )
+                .await
+                .expect("a new file");
         });
     }
 
@@ -21779,6 +22027,34 @@ mod tests {
                 )
                 .await;
             assert!(err.is_err(), "expected error for ambiguous match");
+        });
+    }
+
+    #[test]
+    fn approximate_edit_refuses_an_ambiguous_match() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("twice.py");
+            let body =
+                "def a():\n    x = 1\n\n    return x\n\ndef b():\n    x = 1\n\n    return x\n";
+            std::fs::write(&path, body).unwrap();
+            let tool = EditTool::new(tmp.path());
+            // The indented blank line only matches approximately, in both functions.
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": "    x = 1\n    \n    return x",
+                        "newText": "    y = 2",
+                    }),
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Found 2 occurrences"), "{err}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
         });
     }
 
@@ -24457,6 +24733,113 @@ mod tests {
     }
 
     #[test]
+    fn crlf_edit_starting_with_a_newline_takes_the_whole_line_ending() {
+        // "\nfoo" matches the LF half of "\r\n"; a replacement that kept the
+        // CR wrote "a\r\r\nbar" (or "a\r\r\n" for a deletion).
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("crlf.txt");
+            let tool = EditTool::new(tmp.path());
+            for (old_text, new_text, expected) in [
+                ("\nfoo", "\nbar", "a\r\nbar\r\nz\r\n"),
+                ("\nfoo", "", "a\r\nz\r\n"),
+                ("\nfoo  \n", "\n", "a\r\nz\r\n"),
+            ] {
+                std::fs::write(&path, "a\r\nfoo\r\nz\r\n").unwrap();
+                tool.execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": old_text,
+                        "newText": new_text,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    expected,
+                    "{old_text:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn crlf_edit_keeps_the_needles_trailing_whitespace_once() {
+        // A multi-line needle only matched a CRLF file fuzzily, which trims
+        // each line's trailing whitespace: whitespace ending the needle fell
+        // outside the matched span and the replacement doubled it.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("crlf.rs");
+            let tool = EditTool::new(tmp.path());
+            for (content, old_text, new_text, expected) in [
+                (
+                    "fn a() {\r\n    x();\r\n    y();\r\n}\r\n",
+                    "    x();\n    ",
+                    "    x2();\n    ",
+                    "fn a() {\r\n    x2();\r\n    y();\r\n}\r\n",
+                ),
+                (
+                    "a\r\nfoo  \r\nz\r\n",
+                    "a\nfoo  ",
+                    "a\nbar  ",
+                    "a\r\nbar  \r\nz\r\n",
+                ),
+            ] {
+                std::fs::write(&path, content).expect("write");
+                tool.execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": old_text,
+                        "newText": new_text,
+                    }),
+                    None,
+                )
+                .await
+                .expect("edit");
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("read"),
+                    expected,
+                    "{old_text:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_lone_cr_before_the_first_lf_does_not_make_the_file_cr_terminated() {
+        assert_eq!(detect_line_ending("print('a\rb')\nx = 1\n"), "\n");
+        assert_eq!(detect_line_ending("a\r\r\nb\r\r\n"), "\r\n");
+        assert_eq!(detect_line_ending("\nfirst line empty"), "\n");
+        // The edit used to write the inserted line break as a bare CR.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("cr_in_string.py");
+            std::fs::write(&path, "print('a\rb')\nx = 1\n").expect("write");
+            EditTool::new(tmp.path())
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": "x = 1",
+                        "newText": "x = 1\ny = 2",
+                    }),
+                    None,
+                )
+                .await
+                .expect("edit");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                "print('a\rb')\nx = 1\ny = 2\n"
+            );
+        });
+    }
+
+    #[test]
     fn test_edit_cr_content_correctness() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
@@ -24990,7 +25373,7 @@ mod tests {
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
-            assert!(content.contains("new_line"));
+            assert_eq!(content, "new_line");
         });
     }
 

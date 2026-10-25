@@ -1949,6 +1949,11 @@ fn find_cut_point(
 
     for i in (start_index..end_index).rev() {
         let entry = &entries[i];
+        // A compaction record in the span (a previous compaction's retained
+        // tail precedes it) is a summary, not recent history to keep.
+        if entry_is_compaction_boundary(entry) {
+            continue;
+        }
         if let Some(msg) = message_from_entry(entry) {
             accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg));
         } else {
@@ -2499,6 +2504,19 @@ pub(crate) fn prepare_overflow_compaction(
     prepare_compaction_impl(path_entries, settings, true, false)
 }
 
+/// Manual `/compact` and `/shake` ignore the automatic threshold and the
+/// auto-compaction switch, as in OMP: both decide when pi compacts on its
+/// own, not whether a user may. Like overflow recovery, the latest authored
+/// turn is never summarized. Too little history, or nothing new since the
+/// last compaction, is a no-op.
+pub(crate) fn prepare_manual_compaction(
+    path_entries: &[SessionEntry],
+    mut settings: ResolvedCompactionSettings,
+) -> Option<CompactionPreparation> {
+    settings.enabled = true;
+    prepare_compaction_impl(path_entries, settings, true, false)
+}
+
 /// Manual handoff ignores the automatic threshold and enabled flag, but keeps
 /// the complete latest authored turn and its native attachments/tool tail.
 /// A single user turn, or a keep-recent budget covering all history, has no
@@ -2526,6 +2544,22 @@ fn overflow_compaction_user_index<E: Borrow<SessionEntry>>(path_entries: &[E]) -
         }
     }
     None
+}
+
+/// Where the retained tail of the compaction at `compaction_index` starts:
+/// its first kept entry, which precedes the compaction record.
+fn retained_tail_start(path_entries: &[SessionEntry], compaction_index: usize) -> Option<usize> {
+    let SessionEntry::Compaction(compaction) = path_entries.get(compaction_index)? else {
+        return None;
+    };
+    path_entries
+        .get(..compaction_index)?
+        .iter()
+        .position(|entry| {
+            entry
+                .base_id()
+                .is_some_and(|id| id == &compaction.first_kept_entry_id)
+        })
 }
 
 /// Validate extension overrides at the durable boundary as well as native
@@ -2573,12 +2607,26 @@ fn prepare_compaction_impl(
         }
     }
 
-    let boundary_start = prev_compaction_index.map_or(0, |i| i + 1);
+    // The previous summary excludes its retained tail, whose entries precede
+    // the compaction record. That tail is live context, so this compaction
+    // must summarize or keep it, as OMP's prepareCompaction does.
+    let boundary_start = prev_compaction_index.map_or(0, |prev| {
+        retained_tail_start(path_entries, prev).unwrap_or(prev + 1)
+    });
     let boundary_end = path_entries.len();
 
-    let usage_start = prev_compaction_index.unwrap_or(0);
+    let usage_start = prev_compaction_index.map_or(0, |prev| prev.min(boundary_start));
     let mut usage_messages = Vec::new();
-    for entry in &path_entries[usage_start..boundary_end] {
+    for (idx, entry) in path_entries
+        .iter()
+        .enumerate()
+        .take(boundary_end)
+        .skip(usage_start)
+    {
+        // Only the latest summary is live; older ones are folded into it.
+        if entry_is_compaction_boundary(entry) && Some(idx) != prev_compaction_index {
+            continue;
+        }
         if let Some(msg) = message_from_entry(entry) {
             usage_messages.push(msg);
         }
@@ -2636,8 +2684,13 @@ fn prepare_compaction_impl(
         cut_point.first_kept_entry_index
     };
 
+    // A compaction record inside the span is not summarized again:
+    // `previous_summary` carries the latest, which folds in the older ones.
     let mut messages_to_summarize = Vec::new();
     for entry in &path_entries[boundary_start..history_end] {
+        if entry_is_compaction_boundary(entry) {
+            continue;
+        }
         if let Some(msg) = message_from_entry(entry) {
             messages_to_summarize.push(msg);
         }
@@ -2647,6 +2700,9 @@ fn prepare_compaction_impl(
     if cut_point.is_split_turn {
         let turn_start = cut_point.turn_start_index?;
         for entry in &path_entries[turn_start..cut_point.first_kept_entry_index] {
+            if entry_is_compaction_boundary(entry) {
+                continue;
+            }
             if let Some(msg) = message_from_entry(entry) {
                 turn_prefix_messages.push(msg);
             }
@@ -5314,6 +5370,42 @@ mod tests {
         );
         assert_eq!(prepared.settings.reserve_tokens, settings.reserve_tokens);
         assert!(prepare_overflow_compaction(&[], settings).is_none());
+    }
+
+    #[test]
+    fn manual_preparation_ignores_the_threshold_but_not_a_small_history() {
+        let entries = vec![
+            user_entry("1", "Earlier task with details to summarize."),
+            assistant_entry("2", "Earlier task completed.", 0, 0),
+            user_entry("3", "Continue the current task."),
+        ];
+        let kept = |prepared: Option<CompactionPreparation>| {
+            prepared.map(|prepared| prepared.first_kept_entry_id)
+        };
+        let settings = ResolvedCompactionSettings {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        // Far below the automatic threshold of a 128k window.
+        assert_eq!(kept(prepare_compaction(&entries, settings.clone())), None);
+        assert_eq!(
+            kept(prepare_manual_compaction(&entries, settings.clone())),
+            Some("3".to_string()),
+            "the latest authored turn is kept, older history is summarized"
+        );
+        assert_eq!(
+            kept(prepare_manual_compaction(
+                &entries,
+                ResolvedCompactionSettings::default()
+            )),
+            None,
+            "everything fits in the keep-recent budget"
+        );
+        assert_eq!(
+            kept(prepare_manual_compaction(&entries[2..], settings)),
+            None,
+            "a single authored turn has no older history"
+        );
     }
 
     #[test]

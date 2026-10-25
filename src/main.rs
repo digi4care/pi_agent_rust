@@ -2804,7 +2804,8 @@ async fn run(
         // Sessions pinned with /pin come first, marked (OMP). /resume
         // re-reads the index itself; this is the initial list.
         let ftui_sessions = pi::interactive_ftui::session_pins::resume_entries(
-            &cwd.display().to_string(),
+            &cwd,
+            options.session_dir.as_deref(),
             &Config::global_dir(),
         );
         return pi::interactive_ftui::run(
@@ -9734,11 +9735,31 @@ fn parse_print_command(input: &str, from_argument: bool) -> Result<Option<PrintC
         ("/retry", "") => Ok(Some(PrintCommand::Retry)),
         ("/compact", _) => bail!("Print mode supports /compact or /compact shake"),
         ("/retry", _) => bail!("Print-mode /retry takes no arguments"),
-        ("/handoff", focus) if focus.len() > 4096 || focus.contains('\0') => {
-            bail!("Handoff focus must fit 4096 bytes and contain no NUL")
-        }
-        ("/handoff", _) => Ok(Some(PrintCommand::Handoff)),
+        ("/handoff", args) => match print_handoff_focus(args) {
+            None => bail!(
+                "Print-mode /handoff takes only focus text; --report, --model and --import are terminal options. Use /handoff -- <focus> when the focus starts with '-'."
+            ),
+            Some(focus) if focus.len() > 4096 || focus.contains('\0') => {
+                bail!("Handoff focus must fit 4096 bytes and contain no NUL")
+            }
+            Some(_) => Ok(Some(PrintCommand::Handoff)),
+        },
         _ => Ok(None),
+    }
+}
+
+/// The in-place focus of print-mode `/handoff`, read as the terminal reads
+/// it: `--` escapes a focus that starts with '-', and any other option is
+/// refused rather than sent to the model as focus text.
+fn print_handoff_focus(args: &str) -> Option<&str> {
+    let args = args.trim();
+    let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    if first == "--" {
+        Some(rest.trim())
+    } else if first.starts_with('-') {
+        None
+    } else {
+        Some(args)
     }
 }
 
@@ -10074,11 +10095,16 @@ async fn run_print_mode(
         let _restored =
             maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
         let input = if let Some(command) = request.command {
-            let focus = request
+            let args = request
                 .text
                 .trim()
                 .split_once(char::is_whitespace)
                 .map_or("", |(_, args)| args.trim());
+            let focus = if command == PrintCommand::Handoff {
+                print_handoff_focus(args).unwrap_or_default()
+            } else {
+                args
+            };
             let outcome =
                 execute_print_command(session, command, focus, &abort_signal, make_event_handler())
                     .await?;
@@ -13912,10 +13938,33 @@ mod tests {
             "/retry extra",
             "/compact unknown",
             "/handoff invalid\0focus",
+            // Terminal-only modes are refused, not sent as focus text.
+            "/handoff --report human",
+            "/handoff --model gpt-5",
+            "/handoff -x keep this",
         ] {
             let error = parse_print_command(input, true).unwrap_err();
             assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
         }
+        assert_eq!(
+            parse_print_command("/handoff -- --report is part of the focus", true).unwrap(),
+            Some(PrintCommand::Handoff)
+        );
+        assert_eq!(
+            [
+                "-- --report is part of the focus",
+                " keep X ",
+                "--",
+                "--report human"
+            ]
+            .map(print_handoff_focus),
+            [
+                Some("--report is part of the focus"),
+                Some("keep X"),
+                Some(""),
+                None
+            ]
+        );
         assert!(parse_print_command(&format!("/handoff {}", "x".repeat(4097)), true).is_err());
         let requests = prepare_print_requests(
             vec![
@@ -14318,6 +14367,9 @@ mod tests {
                 let provider = Arc::new(HeadlessCommandProvider::default());
                 let mut session =
                     headless_command_session(&provider, headless_compaction_history(), false, true);
+                // A real window: the history is far below the automatic
+                // threshold, which a requested compaction does not wait for.
+                session.set_compaction_context_window(200_000);
                 let (_abort, signal) = AbortHandle::new();
                 let outcome = execute_print_command(&mut session, command, "", &signal, |_| {})
                     .await

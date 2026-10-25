@@ -501,6 +501,13 @@ pub struct SessionOptions {
     /// still exist; unavailable roots are reported and skipped.
     pub workspace: Option<crate::workspace::WorkspaceHandle>,
 
+    /// Undo history for the default registry's `write`, `edit` and
+    /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty one. A host
+    /// that rebuilds the session, as FTUI does on `/new`, `/resume`, `/reload`
+    /// and `/fork`, passes the same recorder so `/undo` keeps working across
+    /// the rebuild, as on the classic stack. Unused with a [`Self::tool_factory`].
+    pub mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+
     /// Session-level event listener invoked for every [`AgentEvent`].
     ///
     /// Unlike the per-prompt callback passed to [`AgentSessionHandle::prompt`],
@@ -597,6 +604,7 @@ impl Default for SessionOptions {
             extension_flags: Vec::new(),
             tool_factory: None,
             workspace: None,
+            mutation_recorder: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
             skills_prompt: None,
@@ -3017,6 +3025,29 @@ impl AgentSessionHandle {
         Ok(prepared)
     }
 
+    /// Make `entry_id` the current leaf, such as another branch's tip (FTUI
+    /// `/tree <n|id>`), and rebuild the agent's context from that path.
+    /// Persisted and admitted like [`Self::rewind_to_user_message`].
+    pub async fn switch_to_entry(&mut self, entry_id: &str) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        if !candidate.navigate_to(entry_id) {
+            return Err(Error::session(format!("No session entry {entry_id}")));
+        }
+        self.session
+            .install_context_candidate(&mut guard, candidate, true, &admission, "branch switch")
+            .await
+    }
+
     /// Read the per-prompt `max_tokens` cap currently configured on the
     /// session's stream options.
     ///
@@ -3221,20 +3252,23 @@ impl AgentSessionHandle {
         Ok(f(&guard))
     }
 
-    /// Trigger an immediate compaction pass (if compaction is enabled).
+    /// Trigger an immediate compaction pass (if compaction is enabled),
+    /// regardless of the automatic threshold. Returns whether it changed the
+    /// session; `false` means there was too little history to compact.
     pub async fn compact(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.session.compact_now(on_event).await
     }
 
     /// OMP `/shake`: compaction that drops bulky tool output from the older
     /// span instead of summarizing it with the model (no provider request).
+    /// Returns whether it changed the session.
     pub async fn shake(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.session.shake_now(on_event).await
     }
 
@@ -3880,9 +3914,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 &enabled_tools,
                 &cwd,
                 Some(&config),
-                Some(std::sync::Arc::new(
-                    crate::undo::FileMutationRecorder::default(),
-                )),
+                Some(options.mutation_recorder.clone().unwrap_or_default()),
                 workspace.as_ref(),
             )
         },
@@ -5411,6 +5443,8 @@ mod tests {
 
     /// OMP `/shake`: the older span is compacted by dropping bulky content,
     /// recorded as a `shake` compaction, and the provider is never called.
+    /// Auto-compaction is off: it gates pi's own compaction, not the user's
+    /// (turning it off used to make `/compact` and `/shake` no-ops).
     #[test]
     fn shake_compacts_without_a_provider_request() {
         let dir = tempdir().expect("tempdir");
@@ -5427,9 +5461,8 @@ mod tests {
             crate::tools::ToolRegistry::new(&[], Path::new("."), None),
             crate::agent::AgentConfig::default(),
         );
-        // A small window so ~3k tokens of history crosses the threshold.
         let settings = crate::compaction::ResolvedCompactionSettings {
-            enabled: true,
+            enabled: false,
             context_window_tokens: 2_000,
             reserve_tokens: 1_000,
             keep_recent_tokens: 1,
@@ -7437,6 +7470,35 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuilt_session_keeps_the_hosts_undo_history() {
+        // FTUI rebuilds the handle on /new, /resume, /reload and /fork from
+        // one template; a fresh recorder per handle dropped every undo unit.
+        let tmp = tempdir().expect("tempdir");
+        let options = SessionOptions {
+            mutation_recorder: Some(Arc::default()),
+            ..hermetic_session_options(tmp.path())
+        };
+        let shared = options.mutation_recorder.clone().expect("recorder");
+        for _ in 0..2 {
+            let handle = run_async(create_agent_session(options.clone())).expect("create session");
+            let recorder = handle
+                .session()
+                .agent
+                .mutation_recorder()
+                .expect("recorder");
+            assert!(Arc::ptr_eq(&recorder, &shared)); // ubs:ignore[rust.panic.assert-macros] -- pointer identity is a bool
+        }
+        let handle = run_async(create_agent_session(hermetic_session_options(tmp.path())))
+            .expect("create session");
+        let own = handle
+            .session()
+            .agent
+            .mutation_recorder()
+            .expect("recorder");
+        assert!(!Arc::ptr_eq(&own, &shared)); // ubs:ignore[rust.panic.assert-macros] -- pointer identity is a bool
+    }
+
+    #[test]
     fn compact_without_history_is_noop() {
         let tmp = tempdir().expect("tempdir");
         let options = hermetic_session_options(tmp.path());
@@ -7444,13 +7506,14 @@ mod tests {
         let mut handle = run_async(create_agent_session(options)).expect("create session");
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_for_callback = Arc::clone(&events);
-        run_async(handle.compact(move |event| {
+        let changed = run_async(handle.compact(move |event| {
             events_for_callback
                 .lock()
                 .expect("compact callback lock")
                 .push(event);
         }))
         .expect("compact");
+        assert!(!changed, "an empty session reports no change"); // ubs:ignore[rust.panic.assert-macros] -- boolean result; assert_eq! on a bool fails clippy
 
         assert!(
             events

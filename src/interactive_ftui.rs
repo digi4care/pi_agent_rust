@@ -1656,10 +1656,10 @@ pub enum UiCommand {
     /// next turn boundary (`/tan`, bd-ydz1t.2). The UI rejects an empty
     /// argument; the driver enforces that the opt-in `subagent` tool is on.
     Tan(String),
-    /// Print a textual branch-tree summary (`/tree`). The interactive tree
-    /// selector overlay arrives with bd-cv653.9.8; until then /tree reports
-    /// branches/entries instead of falling through to extension dispatch.
-    TreeSummary,
+    /// `/tree` lists the session's branches by number; `/tree <index|id>`
+    /// switches the conversation to that branch's tip. The classic stack's
+    /// interactive tree selector has no FTUI overlay yet.
+    Tree { args: String },
     /// Show (`None`) or set (`Some`) the thinking level (`/thinking`).
     /// The UI validates the level against `ThinkingLevel::from_str` before
     /// sending; invalid levels never reach the driver.
@@ -1874,8 +1874,9 @@ pub struct PiFtuiModel {
     restart_request: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// `(display label, session path)` entries for the `/resume` picker.
     available_sessions: Vec<(String, String)>,
-    /// The session-index cwd `/resume` re-reads (`None`: keep the launch list).
-    resume_cwd: Option<String>,
+    /// The cwd and session directory (`--session-dir`) `/resume` re-reads
+    /// (`None`: keep the launch list).
+    resume_scope: Option<(std::path::PathBuf, Option<std::path::PathBuf>)>,
     /// Keybinding catalog, loaded from the user's config by the launch path
     /// via [`Self::with_keybindings`] and defaulting to the shipped bindings
     /// otherwise. Shared naming with the bubbletea stack via
@@ -2250,7 +2251,7 @@ impl PiFtuiModel {
             pending_quit: false,
             restart_request: None,
             available_sessions: Vec::new(),
-            resume_cwd: None,
+            resume_scope: None,
             keybindings: KeyBindings::default(),
             ext_status: None,
             active_ask: None,
@@ -2463,11 +2464,15 @@ impl PiFtuiModel {
         self
     }
 
-    /// Refresh the `/resume` list from the session index for `cwd` each
-    /// time the picker opens (otherwise the launch list is used as is).
+    /// Refresh the `/resume` list for `cwd`, from `session_dir` when set,
+    /// each time the picker opens (otherwise the launch list is used as is).
     #[must_use]
-    pub fn with_resume_cwd(mut self, cwd: String) -> Self {
-        self.resume_cwd = Some(cwd);
+    pub fn with_resume_scope(
+        mut self,
+        cwd: std::path::PathBuf,
+        session_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        self.resume_scope = Some((cwd, session_dir));
         self
     }
 
@@ -2565,19 +2570,25 @@ impl PiFtuiModel {
 
     /// Recompute the completion popup from the editor contents (issue #208).
     /// Runs after every editor mutation; the popup only ever opens for a
-    /// slash-command draft so ordinary prose never grows a dropdown.
+    /// slash-command draft or an `@file` token under the cursor (anywhere in
+    /// the draft, as in OMP's editor), so ordinary prose never grows a
+    /// dropdown.
     fn maybe_trigger_autocomplete(&mut self) {
         if !self.completion_allowed() {
             self.autocomplete.close();
             return;
         }
         let text = self.input.text();
-        if !text.trim_start().starts_with('/') {
+        let editor = self.input.editor();
+        let cursor = ftui::text::CursorNavigator::new(editor.rope()).to_byte_index(editor.cursor());
+        let file_ref = text
+            .get(..cursor)
+            .and_then(|before| before.rsplit(char::is_whitespace).next())
+            .is_some_and(|token| token.starts_with('@'));
+        if !file_ref && !text.trim_start().starts_with('/') {
             self.autocomplete.close();
             return;
         }
-        let editor = self.input.editor();
-        let cursor = ftui::text::CursorNavigator::new(editor.rope()).to_byte_index(editor.cursor());
         let response = self.autocomplete.provider.suggest(&text, cursor);
         // Bare filesystem-path matches are Tab-triggered in the charmed
         // stack; the popup here is for commands and their arguments.
@@ -2593,7 +2604,7 @@ impl PiFtuiModel {
     }
 
     /// Splice the accepted suggestion over the token it completes and park
-    /// the cursor at the end of the draft.
+    /// the cursor right after it (an `@file` may sit mid-draft).
     fn accept_autocomplete(&mut self, item: &AutocompleteItem) {
         let text = self.input.text();
         let range = &self.autocomplete.replace_range;
@@ -2612,7 +2623,9 @@ impl PiFtuiModel {
         next.push_str(&item.insert);
         next.push_str(&text[end..]);
         self.input.set_text(&next);
-        self.input.move_to_document_end();
+        let after = ftui::text::CursorNavigator::new(self.input.editor().rope())
+            .from_byte_index(start + item.insert.len());
+        self.input.set_cursor_position(after);
     }
 
     /// Keys the open popup owns (issue #208). Returns `true` when the key was
@@ -3571,10 +3584,13 @@ impl PiFtuiModel {
             self.send_command(UiCommand::Prompt(clean));
             return;
         };
+        // The authored text is what Alt+Up restores and keywords scan, not
+        // the file contents read into the message.
+        let content = crate::model::UserContent::Text(steer_text);
         let queued = if follow_up {
-            control.follow_up(&steer_text)
+            control.follow_up_with_content(&content, &clean)
         } else {
-            control.steer(&steer_text)
+            control.steer_with_content(&content, &clean)
         };
         match queued {
             Ok(_) => {
@@ -4190,8 +4206,9 @@ impl PiFtuiModel {
         if canon == "/resume" || canon == "/r" {
             // Re-read the index: sessions saved (and pins set) since launch
             // belong in the list, as in OMP's picker.
-            if let Some(cwd) = &self.resume_cwd {
-                self.available_sessions = session_pins::resume_entries(cwd, &self.pins_dir);
+            if let Some((cwd, session_dir)) = &self.resume_scope {
+                self.available_sessions =
+                    session_pins::resume_entries(cwd, session_dir.as_deref(), &self.pins_dir);
             }
             if self.available_sessions.is_empty() {
                 self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
@@ -4403,7 +4420,9 @@ impl PiFtuiModel {
                 return true;
             }
             "/tree" => {
-                self.send_command(UiCommand::TreeSummary);
+                self.send_command(UiCommand::Tree {
+                    args: cmd_args.trim().to_string(),
+                });
                 return true;
             }
             "/branch" => {
@@ -4809,7 +4828,9 @@ impl PiFtuiModel {
             match self.double_escape_action {
                 DoubleEscapeAction::Rewind => self.request_message_picker(false),
                 DoubleEscapeAction::Fork => self.request_message_picker(true),
-                DoubleEscapeAction::Tree => self.send_command(UiCommand::TreeSummary),
+                DoubleEscapeAction::Tree => self.send_command(UiCommand::Tree {
+                    args: String::new(),
+                }),
                 DoubleEscapeAction::None => {}
             }
         } else {
@@ -5504,6 +5525,16 @@ impl PiFtuiModel {
                 }
             }
             Event::Paste(_) if self.settings_pending => {}
+            // Many terminals send a pasted line break as a bare CR, and the
+            // editor drops control characters: without this a multi-line
+            // paste arrives as one line.
+            Event::Paste(paste) if paste.text.contains('\r') => {
+                let text = paste.text.replace("\r\n", "\n").replace('\r', "\n");
+                let normalized = Event::Paste(ftui::PasteEvent::new(text, paste.bracketed));
+                if self.input_active() && self.input.handle_event(&normalized) {
+                    self.maybe_trigger_autocomplete();
+                }
+            }
             _ => {
                 if self.input_active() && self.input.handle_event(event) {
                     // Paste and other editor-relevant events flow through.
@@ -7853,7 +7884,12 @@ async fn run_compact_command(
         ("compact", "conversation compacted")
     };
     match result {
-        Ok(()) => send_conversation_reset(handle, agent_tx, done).await,
+        Ok(true) => send_conversation_reset(handle, agent_tx, done).await,
+        Ok(false) => {
+            let _ = agent_tx.send(PiMsg::System(format!(
+                "Nothing to {label}: there is too little history since the last compaction"
+            )));
+        }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("{label}: {err}")));
         }
@@ -8037,24 +8073,58 @@ async fn run_tree_summary_command(
     agent_tx: &Sender<PiMsg>,
 ) {
     let summary = handle.with_session(|session| {
-        let leaves = session.list_leaves();
-        let entry_count = session.entries.len();
-        if leaves.is_empty() {
-            return format!("Session tree: no branches, {entry_count} entries");
-        }
-        let rendered = leaves
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n  ");
-        format!(
-            "Session tree: {} branch(es), {entry_count} entries\nLeaves:\n  {rendered}",
-            leaves.len()
+        crate::interactive::format_branch_candidates(
+            &crate::interactive::branch_candidates(session),
+            session.entries.len(),
         )
     });
     match summary.await {
         Ok(text) => {
             let _ = agent_tx.send(PiMsg::System(text));
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {err}")));
+        }
+    }
+}
+
+/// `/tree <index|id>`: move the conversation to that branch's tip, the way
+/// `/rewind` moves it back, so a rewound-away branch stays reachable.
+async fn run_tree_switch_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    args: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let selected = handle
+        .with_session(|session| {
+            crate::interactive::select_branch_candidate(
+                &crate::interactive::branch_candidates(session),
+                args,
+            )
+        })
+        .await;
+    let branch = match selected {
+        Ok(Ok(branch)) => branch,
+        Ok(Err(message)) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {message}")));
+            return;
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {err}")));
+            return;
+        }
+    };
+    if branch.current {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Already on branch {} - {}",
+            branch.leaf_id, branch.summary
+        )));
+        return;
+    }
+    match handle.switch_to_entry(&branch.leaf_id).await {
+        Ok(()) => {
+            let status = format!("Switched to branch {} - {}", branch.leaf_id, branch.summary);
+            send_conversation_reset(handle, agent_tx, &status).await;
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {err}")));
@@ -9271,12 +9341,14 @@ impl BashUiShell {
 /// Run a `!command` for the driver loop: tool-status blips around the shared
 /// bash runner, result rendered via the session display formatter. Returns
 /// the display text on success so the caller can submit it as a turn
-/// (`!` context-inclusion); `!!` gets the exclusion note appended.
+/// (`!` context-inclusion); `!!` gets the exclusion note appended. A
+/// `user_bash` hook that runs the command itself supplies the result.
 async fn run_bash_ui_command(
     cwd: &std::path::Path,
     shell: &BashUiShell,
     command: &str,
     exclude: bool,
+    extensions: Option<&crate::extensions::ExtensionManager>,
     agent_tx: &Sender<PiMsg>,
 ) -> Option<String> {
     // Bracket the run with AgentStart/AgentDone (submit_bash_command
@@ -9288,15 +9360,24 @@ async fn run_bash_ui_command(
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
     });
-    let result = crate::tools::run_bash_command(
-        cwd,
-        shell.path.as_deref(),
-        shell.command_prefix.as_deref(),
-        command,
-        None,
-        None,
-    )
-    .await;
+    let hooked = match extensions {
+        Some(manager) => manager.dispatch_user_bash(command, exclude, cwd).await,
+        None => None,
+    };
+    let result = match hooked {
+        Some(result) => Ok(result),
+        None => {
+            crate::tools::run_bash_command(
+                cwd,
+                shell.path.as_deref(),
+                shell.command_prefix.as_deref(),
+                command,
+                None,
+                None,
+            )
+            .await
+        }
+    };
     let output = match result {
         Ok(result) => {
             let display = crate::session::bash_execution_to_text(
@@ -9589,9 +9670,15 @@ pub fn run(
     // extension or MCP startup is run on this thread.
     let supplied_workspace =
         session_options.working_directory.is_some() && session_options.workspace.is_some();
-    let session_options =
+    let mut session_options =
         futures::executor::block_on(prepare_driver_session_options(session_options))
             .map_err(std::io::Error::other)?;
+    // One undo history for the process, as on the classic stack. `/new`,
+    // `/resume`, `/reload` and `/fork` rebuild the session from a template
+    // cloned from these options, so every handle shares this recorder.
+    session_options
+        .mutation_recorder
+        .get_or_insert_with(Default::default);
     let bash_cwd = driver_bash_cwd(&session_options);
     let workspace = session_options.workspace.clone();
     autocomplete.cwd.clone_from(&bash_cwd);
@@ -9675,7 +9762,8 @@ pub fn run(
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
-    let resume_cwd = bash_cwd.display().to_string();
+    let resume_cwd = bash_cwd.clone();
+    let resume_session_dir = session_options.session_dir.clone();
     let bash_shell = resource_source
         .as_ref()
         .map(|source| BashUiShell::from_config(&source.config))
@@ -9854,11 +9942,13 @@ pub fn run(
                         Ok(UiCommand::Bash { command, exclude }) => {
                             // `!` semantics: the output becomes the next
                             // turn's user content (submit_content parity).
+                            let extensions = handle.extension_manager().cloned();
                             if let Some(output) = run_bash_ui_command(
                                 &bash_cwd,
                                 &bash_shell,
                                 &command,
                                 exclude,
+                                extensions.as_ref(),
                                 &agent_tx,
                             )
                             .await
@@ -10162,8 +10252,12 @@ pub fn run(
                             )
                             .await;
                         }
-                        Ok(UiCommand::TreeSummary) => {
-                            run_tree_summary_command(&handle, &agent_tx).await;
+                        Ok(UiCommand::Tree { args }) => {
+                            if args.is_empty() {
+                                run_tree_summary_command(&handle, &agent_tx).await;
+                            } else {
+                                run_tree_switch_command(&mut handle, &args, &agent_tx).await;
+                            }
                         }
                         Ok(UiCommand::Fast(request)) => {
                             let _ = agent_tx.send(run_fast_command(&mut handle, request));
@@ -10414,7 +10508,7 @@ pub fn run(
         .with_model_names(model_names)
         .with_restart_request(Arc::clone(&restart_requested))
         .with_available_sessions(available_sessions)
-        .with_resume_cwd(resume_cwd)
+        .with_resume_scope(resume_cwd, resume_session_dir)
         .with_alt_screen(!inline)
         .with_mouse_enabled(!disable_mouse_capture)
         .with_markdown_spacing(markdown_spacing)
@@ -10748,6 +10842,7 @@ mod tests {
                 &BashUiShell::default(),
                 "cat probe.txt && printf shell-completed > shell-result.txt",
                 true,
+                None,
                 &agent_tx,
             )
             .await
@@ -11604,15 +11699,13 @@ mod tests {
         let pending = control.take_pending();
         assert_eq!(pending.len(), 1);
         assert!(
-            pending[0].text.contains("the secret is 42"),
-            "{}",
-            pending[0].text
-        );
-        assert!(
-            !pending[0].text.contains("@notes.txt"),
-            "{}",
-            pending[0].text
-        );
+            matches!(&pending[0].content, crate::model::UserContent::Text(sent)
+                if sent.contains("the secret is 42") && !sent.contains("@notes.txt")),
+            "{:?}",
+            pending[0].content
+        ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        // The authored text, which Alt+Up puts back, is what was typed.
+        assert_eq!(pending[0].text, "use @notes.txt");
     }
 
     #[test]
@@ -15250,6 +15343,20 @@ mod tests {
         assert_eq!(sim.model().picker.as_ref().unwrap().query, "claude");
     }
 
+    /// Terminals that send pasted line breaks as bare CRs used to collapse a
+    /// multi-line paste onto one line: the editor drops control characters.
+    #[test]
+    fn paste_with_carriage_returns_keeps_its_lines() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+        sim.init();
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new(
+            "one\rtwo\r\nthree",
+            true,
+        )));
+        assert_eq!(sim.model().input.text(), "one\ntwo\nthree");
+    }
+
     /// GH #182: `!command` on this stack honors `shell_path` and
     /// `shell_command_prefix` from settings, as the classic stack does.
     #[cfg(unix)]
@@ -15403,7 +15510,12 @@ mod tests {
         );
         assert_eq!(
             esc_esc(DoubleEscapeAction::Tree, ""),
-            (None, Some(UiCommand::TreeSummary))
+            (
+                None,
+                Some(UiCommand::Tree {
+                    args: String::new()
+                })
+            )
         );
         assert_eq!(esc_esc(DoubleEscapeAction::None, ""), (None, None));
         // A draft in the editor is never thrown away by a stray double-Esc.
@@ -15559,6 +15671,35 @@ mod tests {
                 agent_rx.try_recv(),
                 Ok(PiMsg::AgentError(text)) if text.starts_with("rewind:")
             ));
+
+            // The rewound-away path is listed by /tree and reachable again.
+            run_tree_summary_command(&handle, &agent_tx).await;
+            let Ok(PiMsg::System(listing)) = agent_rx.try_recv() else {
+                panic!("expected the branch list");
+            };
+            assert!(listing.contains("1. "), "{listing}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            assert!(listing.contains("second question"), "{listing}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            assert!(listing.contains("partway along a branch"), "{listing}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            run_tree_switch_command(&mut handle, "1", &agent_tx).await;
+            let replies: Vec<PiMsg> = agent_rx.try_iter().collect();
+            let Some(PiMsg::ConversationReset {
+                messages: shown, ..
+            }) = replies.first()
+            else {
+                panic!("expected a conversation reset, got {replies:?}");
+            };
+            assert_eq!(shown.len(), 4, "both questions and answers are back");
+            assert_eq!(handle.session().agent.messages().len(), 4);
+            run_tree_switch_command(&mut handle, "1", &agent_tx).await;
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::System(text)) if text.starts_with("Already on branch")
+            ));
+            run_tree_switch_command(&mut handle, "9", &agent_tx).await;
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::AgentError(text)) if text == "tree: Invalid index: 9 (1-1)"
+            ));
         });
     }
 
@@ -15646,6 +15787,7 @@ mod tests {
             &shell,
             "echo \"value=$PI_GH182\"",
             false,
+            None,
             &agent_tx,
         ));
         let output = output.expect("command ran");
@@ -15663,6 +15805,7 @@ mod tests {
             &missing,
             "true",
             false,
+            None,
             &agent_tx,
         ));
         assert!(output.is_none());
@@ -17260,11 +17403,21 @@ mod tests {
             submit_rx.try_recv().expect("routed"),
             UiCommand::SessionInfo
         );
-        type_str(&mut sim, "/tree deep --all");
+        type_str(&mut sim, "/tree");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
-            UiCommand::TreeSummary
+            UiCommand::Tree {
+                args: String::new()
+            }
+        );
+        type_str(&mut sim, "/tree 2 ");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Tree {
+                args: String::from("2")
+            }
         );
         type_str(&mut sim, "/thinking medium");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
@@ -17712,6 +17865,54 @@ mod tests {
             "/help".len(),
             "cursor parks at the end of the accepted draft"
         );
+    }
+
+    /// `@` opens file completion anywhere in the draft, as OMP's editor does;
+    /// the popup used to open only for slash drafts. Accepting parks the
+    /// cursor after the reference, not at the end of the draft.
+    #[test]
+    fn at_reference_opens_file_completion_mid_draft() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "n").expect("write");
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx).with_autocomplete(AutocompleteLaunch {
+            catalog: AutocompleteCatalog::default(),
+            cwd: dir.path().to_path_buf(),
+            max_visible: 5,
+            resources: None,
+            resource_source: None,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "read  please");
+        assert!(!sim.model().autocomplete.open, "prose stays closed"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        for _ in 0.." please".len() {
+            sim.inject_event(key(KeyCode::Left, Modifiers::empty()));
+        }
+        type_str(&mut sim, "@no");
+        // The project file index fills on a background thread.
+        for _ in 0..300 {
+            if sim.model().completion_visible() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            sim.model_mut().maybe_trigger_autocomplete();
+        }
+        assert!(
+            sim.model().completion_visible(),
+            "an @ token opens file completion"
+        ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        assert_eq!(
+            sim.model()
+                .autocomplete
+                .items
+                .first()
+                .map(|item| item.insert.as_str()),
+            Some("@notes.txt")
+        );
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "read @notes.txt please");
+        assert_eq!(sim.model().input.cursor().grapheme, "read @notes.txt".len());
     }
 
     #[test]

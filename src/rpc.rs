@@ -4190,9 +4190,25 @@ pub async fn run(
                 let runtime_handle = options.runtime_handle.clone();
                 let bash_cx = cx.clone();
                 let cwd = runtime_cwd.clone();
+                let extensions = rpc_extension_manager.clone();
 
                 runtime_handle.spawn(async move {
-                    let result = run_bash_rpc(&cwd, &command, abort_rx).await;
+                    // A `user_bash` hook may run the command itself (OMP's
+                    // bash runner consults it for every user command).
+                    let hooked = match &extensions {
+                        Some(manager) => manager.dispatch_user_bash(&command, false, &cwd).await,
+                        None => None,
+                    };
+                    let result = match hooked {
+                        Some(result) => Ok(BashRpcResult {
+                            output: result.output,
+                            exit_code: result.exit_code,
+                            cancelled: result.cancelled,
+                            truncated: result.truncated,
+                            full_output_path: result.full_output_path,
+                        }),
+                        None => run_bash_rpc(&cwd, &command, abort_rx).await,
+                    };
 
                     let response = match result {
                         Ok(result) => {
@@ -4625,11 +4641,17 @@ pub async fn run(
                         ..Default::default()
                     };
 
-                    let prep = prepare_compaction(&path_entries, settings).ok_or_else(|| {
-                        Error::session(
-                            "Compaction not available (already compacted or missing IDs)",
-                        )
-                    })?;
+                    // A requested compaction ignores the automatic threshold
+                    // but still honors a disabled configuration.
+                    let enabled = settings.enabled;
+                    let prep = enabled
+                        .then(|| crate::compaction::prepare_manual_compaction(&path_entries, settings))
+                        .flatten()
+                        .ok_or_else(|| {
+                            Error::session(
+                                "Compaction not available (disabled, already compacted, or too little history)",
+                            )
+                        })?;
 
                     let privacy = guard.agent.compaction_privacy();
                     let compact_res = compact(
