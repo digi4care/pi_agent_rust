@@ -3,7 +3,7 @@
   "bead_id": "bd-3uqg.9.3.2",
   "generated_at_utc": "2026-08-06T09:40:00Z",
   "generated_by": "manual source reconciliation against src/provider_metadata.rs and auth runtime tests",
-  "description": "Canonical/alias/env-key auth crosswalk covering all 103 registered Pi provider IDs. Registration does not imply that every provider has an executable native route. Request-wire authentication is modeled separately from credential acquisition so an OAuth exchange, device flow, external credential, or AWS chain is never mistaken for the header value sent to inference.",
+  "description": "Canonical/alias/env-key auth crosswalk covering all 104 registered Pi provider IDs. Registration does not imply that every provider has an executable native route. Request-wire authentication is modeled separately from credential acquisition so an OAuth exchange, device flow, external credential, or AWS chain is never mistaken for the header value sent to inference.",
   "provider_row_contract": {
     "auth_method": "Primary request-wire authentication method ID from request_auth_methods.",
     "additional_auth_methods": "Optional additional request-wire method IDs supported when the credential type selects a different wire lane.",
@@ -55,15 +55,16 @@
   "request_auth_methods": {
     "bearer_token": {
       "header": "Authorization: Bearer {API_KEY}",
-      "providers_count": 92,
+      "providers_count": 93,
       "description": "Bearer value on the inference request. How the value was acquired (direct key, OAuth, device flow, external CLI, Bedrock override, or SAP exchange) is modeled separately."
     },
     "x_api_key": {
       "header": "X-API-Key: {API_KEY}",
-      "providers_count": 8,
+      "providers_count": 9,
       "providers": [
         "anthropic",
         "kimi-for-coding",
+        "kimi-for-coding-global",
         "minimax",
         "minimax-cn",
         "minimax-coding-plan",
@@ -165,11 +166,16 @@
         "direct_api_key",
         "kimi_device_oauth",
         "external_cli_credentials"
+      ],
+      "kimi-for-coding-global": [
+        "direct_api_key",
+        "kimi_device_oauth",
+        "external_cli_credentials"
       ]
     },
     "methods": {
       "direct_api_key": {
-        "providers_count": 95,
+        "providers_count": 96,
         "description": "Complete API key supplied explicitly, through a provider API-key environment variable, or from stored ApiKey auth."
       },
       "oauth_login": {
@@ -185,21 +191,23 @@
         "description": "Interactive browser OAuth login stores an access token or, for Copilot, the GitHub token used by the required session-token exchange."
       },
       "external_cli_credentials": {
-        "providers_count": 6,
+        "providers_count": 7,
         "providers": [
           "anthropic",
           "openai",
           "openai-codex",
           "google-gemini-cli",
           "google-antigravity",
-          "kimi-for-coding"
+          "kimi-for-coding",
+          "kimi-for-coding-global"
         ],
         "description": "Credential auto-detected from a supported Claude, Codex, Gemini, or Kimi CLI installation."
       },
       "kimi_device_oauth": {
-        "providers_count": 1,
+        "providers_count": 2,
         "providers": [
-          "kimi-for-coding"
+          "kimi-for-coding",
+          "kimi-for-coding-global"
         ],
         "description": "Kimi RFC 8628-style device authorization and token polling; the resulting access token uses the bearer request lane and Kimi device headers."
       },
@@ -811,6 +819,23 @@
       "base_url": "https://api.kimi.com/coding/v1/messages",
       "tier": "anthropic_proxy",
       "notes": "sk-* API keys use X-API-Key; device-flow and external Kimi CLI access tokens use Authorization Bearer plus Kimi device headers"
+    },
+    {
+      "canonical_id": "kimi-for-coding-global",
+      "aliases": [
+        "kimi-coding-global",
+        "kimi-ai"
+      ],
+      "env_keys": [
+        "KIMI_API_KEY"
+      ],
+      "auth_method": "x_api_key",
+      "additional_auth_methods": [
+        "bearer_token"
+      ],
+      "base_url": "https://api.kimi.ai/coding/v1/messages",
+      "tier": "anthropic_proxy",
+      "notes": "Global-region variant of kimi-for-coding (auth.kimi.ai / api.kimi.ai); same two request-auth lanes"
     },
     {
       "canonical_id": "minimax",
@@ -1500,7 +1525,7 @@
   "acceptance_criteria_compliance": {
     "criterion_1": {
       "requirement": "Crosswalk covers canonical IDs, common aliases, env key precedence, and base URL defaults/overrides",
-      "status": "PASS — all 103 registered providers listed with canonical_id, aliases, env_keys, request-auth classification, base_url, and tier"
+      "status": "PASS — all 104 registered providers listed with canonical_id, aliases, env_keys, request-auth classification, base_url, and tier"
     },
     "criterion_2": {
       "requirement": "Includes high-confusion mappings (azure, azure-cognitive-services, fireworks-ai, qwen, kimi, google-vertex-anthropic)",

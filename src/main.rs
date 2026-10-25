@@ -8770,6 +8770,12 @@ const PROVIDER_CHOICES: &[ProviderChoice] = &[
         env: "KIMI_API_KEY",
     },
     ProviderChoice {
+        provider: "kimi-for-coding-global",
+        label: "Kimi for Coding (Global)",
+        kind: SetupCredentialKind::OAuthDeviceFlow,
+        env: "KIMI_API_KEY",
+    },
+    ProviderChoice {
         provider: "google-gemini-cli",
         label: "Google Cloud Code Assist",
         kind: SetupCredentialKind::OAuthPkce,
@@ -9163,7 +9169,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
         }
         SetupCredentialKind::OAuthDeviceFlow => {
-            if provider.provider.ne("kimi-for-coding") {
+            if provider.provider.ne("kimi-for-coding")
+                && provider.provider.ne("kimi-for-coding-global")
+            {
                 console.render_warning(&format!(
                     "Device-flow login not supported for {} in this setup flow. Start Pi and run /login {} instead.",
                     provider.provider, provider.provider
@@ -9171,7 +9179,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 return Ok(false);
             }
 
-            let device = pi::auth::start_kimi_code_device_flow().await?;
+            let device = pi::auth::start_kimi_code_device_flow_for(provider.provider).await?;
             let verification_url = device
                 .verification_uri_complete
                 .clone()
@@ -9202,7 +9210,7 @@ Code expires in {} seconds.\n",
                     return Ok(false);
                 }
 
-                match pi::auth::poll_kimi_code_device_flow(&device.device_code).await {
+                match pi::auth::poll_kimi_code_device_flow_for(provider.provider, &device.device_code).await {
                     pi::auth::DeviceFlowPollResult::Success(cred) => break cred,
                     pi::auth::DeviceFlowPollResult::Pending => {
                         console.render_info("Authorization still pending. Complete the browser step and poll again.");

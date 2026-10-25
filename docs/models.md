@@ -262,6 +262,7 @@ onboarding modes, generated from `PROVIDER_METADATA` in
 | `alibaba-cn` | Alibaba China | - | `DASHSCOPE_API_KEY` | openai-compatible preset |
 | `alibaba-us` | Alibaba US | - | `DASHSCOPE_API_KEY`, `QWEN_API_KEY` | openai-compatible preset |
 | `kimi-for-coding` | Kimi for Coding | kimi-coding, kimi-code | `KIMI_API_KEY` | openai-compatible preset |
+| `kimi-for-coding-global` | Kimi for Coding (Global) | kimi-coding-global, kimi-ai | `KIMI_API_KEY` | openai-compatible preset |
 | `minimax` | MiniMax | - | `MINIMAX_API_KEY` | openai-compatible preset |
 | `minimax-cn` | MiniMax China | - | `MINIMAX_CN_API_KEY` | openai-compatible preset |
 | `minimax-coding-plan` | MiniMax Coding Plan | - | `MINIMAX_API_KEY` | openai-compatible preset |

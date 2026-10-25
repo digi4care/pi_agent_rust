@@ -285,6 +285,15 @@
         "notes": "Distinct from moonshotai/kimi alias; this is a coding-specific variant"
       },
       {
+        "canonical_id": "kimi-for-coding-global",
+        "aliases": [
+          "kimi-coding-global",
+          "kimi-ai"
+        ],
+        "source": "models.dev",
+        "notes": "Global-region variant of kimi-for-coding (api.kimi.ai / auth.kimi.ai)"
+      },
+      {
         "canonical_id": "llama",
         "aliases": [],
         "source": "models.dev"
@@ -689,8 +698,10 @@
     "hugging-face": "huggingface",
     "github-copilot-enterprise": "github-copilot",
     "kimi": "moonshotai",
+    "kimi-ai": "kimi-for-coding-global",
     "kimi-code": "kimi-for-coding",
     "kimi-coding": "kimi-for-coding",
+    "kimi-coding-global": "kimi-for-coding-global",
     "llama-cpp": "llamacpp",
     "llama-server": "llamacpp",
     "llama.cpp": "llamacpp",
@@ -746,8 +757,8 @@
     }
   ],
   "summary": {
-    "total_canonical_ids": 103,
-    "total_aliases": 62,
+    "total_canonical_ids": 104,
+    "total_aliases": 64,
     "retired_provider_ids": 1,
     "normalization": "trim + case-insensitive registered canonical-or-alias match"
   }

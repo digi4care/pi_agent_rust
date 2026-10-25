@@ -118,8 +118,8 @@ pub async fn start_login(
     let requested = args.split_whitespace().next().unwrap_or(args);
     let provider = normalize_auth_provider_input(requested);
 
-    let device = if provider == "kimi-for-coding" {
-        Some(crate::auth::start_kimi_code_device_flow().await)
+    let device = if provider == "kimi-for-coding" || provider == "kimi-for-coding-global" {
+        Some(crate::auth::start_kimi_code_device_flow_for(&provider).await)
     } else if (provider == "github-copilot" || provider == "copilot")
         && should_use_copilot_device_flow()
     {
@@ -322,8 +322,12 @@ pub(super) async fn obtain_credential(
                     "Device flow missing device_code".to_string(),
                 )));
             };
-            let poll = if provider == "kimi-for-coding" {
-                Box::pin(crate::auth::poll_kimi_code_device_flow(device_code)).await
+            let poll = if provider == "kimi-for-coding" || provider == "kimi-for-coding-global" {
+                Box::pin(crate::auth::poll_kimi_code_device_flow_for(
+                    &provider,
+                    device_code,
+                ))
+                .await
             } else if provider == "github-copilot" || provider == "copilot" {
                 Box::pin(crate::auth::poll_copilot_device_flow(
                     &copilot_config(),

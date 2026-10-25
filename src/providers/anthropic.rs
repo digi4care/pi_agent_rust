@@ -128,7 +128,10 @@ fn is_anthropic_bearer_token(provider: &str, token: &str) -> bool {
 
 #[inline]
 fn is_kimi_coding_provider(provider: &str) -> bool {
-    canonical_provider_id(provider).unwrap_or(provider) == "kimi-for-coding"
+    matches!(
+        canonical_provider_id(provider).unwrap_or(provider),
+        "kimi-for-coding" | "kimi-for-coding-global"
+    )
 }
 
 #[inline]

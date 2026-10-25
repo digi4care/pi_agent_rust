@@ -2758,7 +2758,7 @@ impl PiApp {
         let requested_provider = args.split_whitespace().next().unwrap_or(args).to_string();
         let provider = normalize_auth_provider_input(&requested_provider);
 
-        if provider == "kimi-for-coding" {
+        if provider == "kimi-for-coding" || provider == "kimi-for-coding-global" {
             self.status_message = Some("Starting Kimi Code login...".to_string());
             let event_tx = self.event_tx.clone();
             let provider_clone = provider;
@@ -2766,7 +2766,7 @@ impl PiApp {
             let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
 
             runtime_handle.spawn(async move {
-                match crate::auth::start_kimi_code_device_flow().await {
+                match crate::auth::start_kimi_code_device_flow_for(&provider_clone).await {
                     Ok(device) => {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,

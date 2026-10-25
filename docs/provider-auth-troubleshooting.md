@@ -96,6 +96,7 @@ coverage is not a claim that every ID has an executable native route; use
 | Canonical ID | Aliases | Auth env vars | Default endpoint |
 |---|---|---|---|
 | `kimi-for-coding` | `kimi-coding`, `kimi-code` | `KIMI_API_KEY` | `https://api.kimi.com/coding/v1/messages` |
+| `kimi-for-coding-global` | `kimi-coding-global`, `kimi-ai` | `KIMI_API_KEY` | `https://api.kimi.ai/coding/v1/messages` |
 | `minimax` | — | `MINIMAX_API_KEY` | `https://api.minimax.io/anthropic/v1/messages` |
 | `minimax-cn` | — | `MINIMAX_CN_API_KEY` | `https://api.minimaxi.com/anthropic/v1/messages` |
 | `minimax-coding-plan` | — | `MINIMAX_API_KEY` | `https://api.minimax.io/anthropic/v1/messages` |
@@ -109,6 +110,13 @@ Tokens obtained by `/login kimi-for-coding` or imported from the Kimi CLI are
 sent as `Authorization: Bearer` with the required Kimi device headers. Do not
 diagnose the absence of `x-api-key` as a failure when an OAuth/external token is
 active.
+
+`kimi-for-coding-global` is the global-region variant: it talks to
+`https://api.kimi.ai/coding/v1/messages` and its OAuth device flow uses
+`https://auth.kimi.ai` instead of `https://auth.kimi.com`. The same two auth
+lanes apply (`sk-*` API key as `x-api-key`, or OAuth device-flow/Kimi CLI
+imported tokens as bearer). The `KIMI_CODE_OAUTH_HOST` / `KIMI_OAUTH_HOST`
+override still wins over both regional defaults.
 
 ### OpenAI-compatible presets (longtail)
 

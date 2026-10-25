@@ -1036,6 +1036,23 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
+        canonical_id: "kimi-for-coding-global",
+        display_name: Some("Kimi for Coding (Global)"),
+        aliases: &["kimi-coding-global", "kimi-ai"],
+        auth_env_keys: &["KIMI_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "anthropic-messages",
+            base_url: "https://api.kimi.ai/coding/v1/messages",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT_IMAGE,
+            context_window: 262_144,
+            max_tokens: 32_768,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
         canonical_id: "minimax",
         display_name: Some("MiniMax"),
         aliases: &[],
@@ -1975,6 +1992,18 @@ mod tests {
         assert_eq!(kimi_coding_alias.canonical_id, "kimi-for-coding");
         let kimi_code_alias = provider_metadata("kimi-code").expect("kimi-code alias metadata");
         assert_eq!(kimi_code_alias.canonical_id, "kimi-for-coding");
+        let kimi_global_alias =
+            provider_metadata("kimi-ai").expect("kimi-ai alias metadata");
+        assert_eq!(kimi_global_alias.canonical_id, "kimi-for-coding-global");
+    }
+
+    #[test]
+    fn kimi_for_coding_global_uses_kimi_ai_endpoint() {
+        let meta = provider_metadata("kimi-for-coding-global").expect("kimi global metadata");
+        let routing = meta.routing_defaults.expect("kimi global routing defaults");
+        assert_eq!(routing.base_url, "https://api.kimi.ai/coding/v1/messages");
+        assert_eq!(routing.api, "anthropic-messages");
+        assert_eq!(meta.auth_env_keys, &["KIMI_API_KEY"]);
     }
 
     #[test]

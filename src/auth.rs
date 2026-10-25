@@ -122,6 +122,7 @@ const GITLAB_DEFAULT_SCOPES: &str = "api read_api read_user";
 // ── Kimi Code OAuth constants ─────────────────────────────────────
 const KIMI_CODE_OAUTH_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const KIMI_CODE_OAUTH_DEFAULT_HOST: &str = "https://auth.kimi.com";
+const KIMI_CODE_OAUTH_GLOBAL_HOST: &str = "https://auth.kimi.ai";
 const KIMI_CODE_OAUTH_HOST_ENV_KEYS: [&str; 2] = ["KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST"];
 const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 const KIMI_CODE_DEVICE_AUTHORIZATION_PATH: &str = "/api/oauth/device_authorization";
@@ -1991,10 +1992,10 @@ impl AuthStorage {
                         "google-antigravity OAuth credential missing projectId payload".to_string(),
                     )),
                 },
-                "kimi-for-coding" => {
+                "kimi-for-coding" | "kimi-for-coding-global" => {
                     let token_url = stored_token_url
                         .clone()
-                        .unwrap_or_else(kimi_code_token_endpoint);
+                        .unwrap_or_else(|| kimi_code_token_endpoint_for(refresh_provider));
                     Box::pin(refresh_kimi_code_oauth_token(
                         client,
                         &token_url,
@@ -2074,6 +2075,7 @@ impl AuthStorage {
                         | "google-gemini-cli"
                         | "google-antigravity"
                         | "kimi-for-coding"
+                        | "kimi-for-coding-global"
                 ) {
                     continue;
                 }
@@ -2602,7 +2604,7 @@ fn resolve_external_provider_api_key(provider: &str) -> Option<String> {
                 google_project_id_from_env().unwrap_or_else(google_antigravity_default_project_id);
             read_external_gemini_access_payload(Some(project.as_str()))
         }
-        "kimi-for-coding" => read_external_kimi_code_access_token(),
+        "kimi-for-coding" | "kimi-for-coding-global" => read_external_kimi_code_access_token(),
         _ => None,
     }
 }
@@ -2637,7 +2639,9 @@ pub fn external_setup_source(provider: &str) -> Option<&'static str> {
                 None
             }
         }
-        "kimi-for-coding" if read_external_kimi_code_access_token().is_some() => Some(
+        "kimi-for-coding" | "kimi-for-coding-global"
+            if read_external_kimi_code_access_token().is_some() =>
+        Some(
             "Kimi CLI (~/.kimi/credentials/kimi-code.json or $KIMI_SHARE_DIR/credentials/kimi-code.json)",
         ),
         _ => None,
@@ -4994,7 +4998,7 @@ fn build_url_with_query(base: &str, params: &[(&str, &str)]) -> String {
     url
 }
 
-fn kimi_code_oauth_host_with_env_lookup<F>(env_lookup: F) -> String
+fn kimi_code_oauth_host_with_env_lookup_and_default<F>(env_lookup: F, default_host: &str) -> String
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -5005,19 +5009,50 @@ where
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
-        .unwrap_or_else(|| KIMI_CODE_OAUTH_DEFAULT_HOST.to_string())
+        .unwrap_or_else(|| default_host.to_string())
+}
+
+fn kimi_code_oauth_host_with_env_lookup<F>(env_lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    kimi_code_oauth_host_with_env_lookup_and_default(env_lookup, KIMI_CODE_OAUTH_DEFAULT_HOST)
 }
 
 fn kimi_code_oauth_host() -> String {
     kimi_code_oauth_host_with_env_lookup(|key| std::env::var(key).ok())
 }
 
+fn kimi_code_oauth_host_for_provider_with_env_lookup<F>(
+    provider: &str,
+    env_lookup: F,
+) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let default_host = if canonical_provider_id(provider).unwrap_or(provider)
+        == "kimi-for-coding-global"
+    {
+        KIMI_CODE_OAUTH_GLOBAL_HOST
+    } else {
+        KIMI_CODE_OAUTH_DEFAULT_HOST
+    };
+    kimi_code_oauth_host_with_env_lookup_and_default(env_lookup, default_host)
+}
+
+fn kimi_code_oauth_host_for_provider(provider: &str) -> String {
+    kimi_code_oauth_host_for_provider_with_env_lookup(provider, |key| std::env::var(key).ok())
+}
+
 fn kimi_code_endpoint_for_host(host: &str, path: &str) -> String {
     format!("{}{}", trim_trailing_slash(host), path)
 }
 
-fn kimi_code_token_endpoint() -> String {
-    kimi_code_endpoint_for_host(&kimi_code_oauth_host(), KIMI_CODE_TOKEN_PATH)
+fn kimi_code_token_endpoint_for(provider: &str) -> String {
+    kimi_code_endpoint_for_host(
+        &kimi_code_oauth_host_for_provider(provider),
+        KIMI_CODE_TOKEN_PATH,
+    )
 }
 
 fn home_dir_with_env_lookup<F>(env_lookup: F) -> Option<PathBuf>
@@ -5844,8 +5879,14 @@ async fn refresh_google_antigravity_oauth_token(
 
 /// Start Kimi Code OAuth device flow.
 pub async fn start_kimi_code_device_flow() -> Result<DeviceCodeResponse> {
+    start_kimi_code_device_flow_for("kimi-for-coding").await
+}
+
+/// Start Kimi Code OAuth device flow for a specific provider id.
+pub async fn start_kimi_code_device_flow_for(provider: &str) -> Result<DeviceCodeResponse> {
     let client = crate::http::client::Client::new();
-    start_kimi_code_device_flow_with_client(&client, &kimi_code_oauth_host()).await
+    start_kimi_code_device_flow_with_client(&client, &kimi_code_oauth_host_for_provider(provider))
+        .await
 }
 
 async fn start_kimi_code_device_flow_with_client(
@@ -5887,8 +5928,21 @@ async fn start_kimi_code_device_flow_with_client(
 
 /// Poll Kimi Code OAuth device flow.
 pub async fn poll_kimi_code_device_flow(device_code: &str) -> DeviceFlowPollResult {
+    poll_kimi_code_device_flow_for("kimi-for-coding", device_code).await
+}
+
+/// Poll Kimi Code OAuth device flow for a specific provider id.
+pub async fn poll_kimi_code_device_flow_for(
+    provider: &str,
+    device_code: &str,
+) -> DeviceFlowPollResult {
     let client = crate::http::client::Client::new();
-    poll_kimi_code_device_flow_with_client(&client, &kimi_code_oauth_host(), device_code).await
+    poll_kimi_code_device_flow_with_client(
+        &client,
+        &kimi_code_oauth_host_for_provider(provider),
+        device_code,
+    )
+    .await
 }
 
 async fn poll_kimi_code_device_flow_with_client(
@@ -10241,6 +10295,30 @@ mod tests {
     }
 
     #[test]
+    fn test_kimi_code_oauth_host_for_provider_env_override_wins() {
+        let host = kimi_code_oauth_host_for_provider_with_env_lookup(
+            "kimi-for-coding-global",
+            |key| match key {
+                "KIMI_CODE_OAUTH_HOST" => Some("https://override.kimi.test".to_string()),
+                _ => None,
+            },
+        );
+        assert_eq!(host, "https://override.kimi.test");
+    }
+
+    #[test]
+    fn test_kimi_code_oauth_host_for_provider_resolves_region_default() {
+        let global = kimi_code_oauth_host_for_provider_with_env_lookup("kimi-for-coding-global", |_| None);
+        assert_eq!(global, "https://auth.kimi.ai");
+        let via_alias = kimi_code_oauth_host_for_provider_with_env_lookup("kimi-ai", |_| None);
+        assert_eq!(via_alias, "https://auth.kimi.ai");
+        let via_alias = kimi_code_oauth_host_for_provider_with_env_lookup("kimi-coding-global", |_| None);
+        assert_eq!(via_alias, "https://auth.kimi.ai");
+        let default = kimi_code_oauth_host_for_provider_with_env_lookup("kimi-for-coding", |_| None);
+        assert_eq!(default, "https://auth.kimi.com");
+    }
+
+    #[test]
     fn test_kimi_share_dir_env_lookup_prefers_kimi_share_dir() {
         let share_dir = kimi_share_dir_with_env_lookup(|key| match key {
             "KIMI_SHARE_DIR" => Some("/tmp/custom-kimi-share".to_string()),
@@ -10376,6 +10454,36 @@ mod tests {
             assert_eq!(
                 response.verification_uri_complete.as_deref(),
                 Some("https://auth.kimi.com/device?user_code=ABCD-1234")
+            );
+        });
+    }
+
+    #[test]
+    fn test_start_kimi_code_device_flow_global_parses_response() {
+        let host = spawn_oauth_host_server(
+            200,
+            r#"{
+                "device_code": "dc_global",
+                "user_code": "WXYZ-9876",
+                "verification_uri": "https://auth.kimi.ai/device",
+                "verification_uri_complete": "https://auth.kimi.ai/device?user_code=WXYZ-9876",
+                "expires_in": 900,
+                "interval": 5
+            }"#,
+        );
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let client = crate::http::client::Client::new();
+            let response = start_kimi_code_device_flow_with_client(&client, &host)
+                .await
+                .expect("start kimi global device flow");
+            assert_eq!(response.device_code, "dc_global");
+            assert_eq!(response.user_code, "WXYZ-9876");
+            assert_eq!(response.expires_in, 900);
+            assert_eq!(response.interval, 5);
+            assert_eq!(
+                response.verification_uri_complete.as_deref(),
+                Some("https://auth.kimi.ai/device?user_code=WXYZ-9876")
             );
         });
     }

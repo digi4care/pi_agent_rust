@@ -906,6 +906,24 @@
       }
     },
     {
+      "aliases": [
+        "kimi-coding-global",
+        "kimi-ai"
+      ],
+      "auth_env_keys": [
+        "KIMI_API_KEY"
+      ],
+      "canonical_id": "kimi-for-coding-global",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "anthropic-messages",
+        "auth_header": false,
+        "base_url": "https://api.kimi.ai/coding/v1/messages",
+        "context_window": 262144,
+        "max_tokens": 32768
+      }
+    },
+    {
       "aliases": [],
       "auth_env_keys": [
         "MINIMAX_API_KEY"
@@ -1606,6 +1624,6 @@
     }
   ],
   "schema_version": "1.0",
-  "total_aliases": 62,
-  "total_providers": 103
+  "total_aliases": 64,
+  "total_providers": 104
 }
